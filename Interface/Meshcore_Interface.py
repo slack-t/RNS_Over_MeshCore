@@ -71,6 +71,10 @@ class MeshCoreInterface(Interface):
         # 🔑 Задержка между фрагментами в секундах (по умолчанию 0.1 = 100 мс)
         self.fragment_delay = float(ifconf.get("fragment_delay", 20))
         self.fragment_timeout = int(ifconf.get("fragment_timeout", 180))
+        self.fragment_delay_min = float(ifconf.get("fragment_delay_min", 2.0))
+        self.fragment_delay_max = float(ifconf.get("fragment_delay_max", 60.0))
+        self.delay_step_down = float(ifconf.get("delay_step_down", 0.5))
+        self.delay_backoff_factor = float(ifconf.get("delay_backoff_factor", 1.5))
         
         # State
         self.online = False
@@ -83,7 +87,12 @@ class MeshCoreInterface(Interface):
         self._fragment_meta = {}
         self._fragment_timestamps = {}
         self._recent_packets = {}
-        
+
+        # Async TX queue and worker
+        self._tx_queue = None
+        self._tx_worker_task = None
+        self._current_delay = self.fragment_delay
+
         # MeshCore refs
         self._meshcore_cls = MeshCore
         self._event_type_cls = EventType
@@ -229,6 +238,17 @@ class MeshCoreInterface(Interface):
             self.online = True
         
         RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx})", RNS.LOG_INFO)
+
+        # Start async TX queue and worker
+        if self._tx_worker_task and not self._tx_worker_task.done():
+            self._tx_worker_task.cancel()
+            try:
+                await self._tx_worker_task
+            except asyncio.CancelledError:
+                pass
+        self._tx_queue = asyncio.Queue()
+        self._current_delay = self.fragment_delay
+        self._tx_worker_task = asyncio.get_event_loop().create_task(self._tx_worker())
 
     async def _open_ble_mesh(self):
         if self.ble_name:
@@ -443,47 +463,16 @@ class MeshCoreInterface(Interface):
             RNS.log(f"[{self.name}] _err handler error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
 
     def process_outgoing(self, data):
+        """Queue data for async transmission. Non-blocking."""
         with self._lock:
             if not self.online or self.mesh is None or self.loop is None:
                 return
-
-        fragments = self._fragment_outgoing(data)
-        
-        now = time.time()
-        
-        for i, fragment in enumerate(fragments):
-            # Rate limiting по bitrate
-            if self.bitrate > 0:
-                min_interval = len(fragment) / self.bitrate
-                elapsed = now - self._last_tx
-                if elapsed < min_interval:
-                    time.sleep(min_interval - elapsed)
-                    now = time.time()
-            self._last_tx = now
-
-            
-
-            with self._lock:
-                self.txb += len(fragment)
-
-            # 🔑 Callback для обработки ошибок
-            def _tx_callback(fut, frag_num=i+1):
-                try:
-                    fut.result()
-                except Exception as e:
-                    RNS.log(f"[{self.name}] TX async error on fragment {frag_num}: {e}", RNS.LOG_ERROR)
-                    with self._lock:
-                        self.online = False
-            
-            # 🔑 Отправляем асинхронно
-            if not self.detached and self.loop and self.loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(self._send(fragment), self.loop)
-                future.add_done_callback(_tx_callback)
-            
-            # 🔑 Задержка между фрагментами (синхронная)
-            if self.fragment_delay > 0:
-                time.sleep(self.fragment_delay)
-                now = time.time()
+            if self._tx_queue is None:
+                return
+        try:
+            self.loop.call_soon_threadsafe(self._tx_queue.put_nowait, data)
+        except Exception as e:
+            RNS.log(f"[{self.name}] TX queue error: {e}", RNS.LOG_ERROR)
     async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
         """
         Отправляет сырые байты в канал MeshCore, минуя utf-8 кодирование.
@@ -517,24 +506,75 @@ class MeshCoreInterface(Interface):
         
         return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
     
-    async def _send(self, data):
-        """Send RNS packet as channel message"""
+    async def _tx_worker(self):
+        """Async worker: drains TX queue, fragments, sends with interleaved repetition and adaptive pacing."""
         try:
-            for i in range(self.count_repeat):
-                msg_str = base64.b64encode(data).decode("ascii")
-                result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
-                #result = await self._send_channel_raw(self.channel_idx, msg_str)
-                #result = await self._send_raw(data)
+            while not self.detached:
+                data = await self._tx_queue.get()
 
-                if result.type == self._event_type_cls.ERROR:
-                    RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
-                RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
-                RNS.log(f"[{self.name}] TX data: {msg_str}", RNS.LOG_DEBUG)
-            
-                
+                with self._lock:
+                    if not self.online or self.mesh is None:
+                        self._tx_queue.task_done()
+                        continue
+
+                fragments = self._fragment_outgoing(data)
+
+                for round_num in range(self.count_repeat):
+                    for fragment in fragments:
+                        # Bitrate pacing
+                        if self.bitrate > 0:
+                            min_interval = len(fragment) / self.bitrate
+                            elapsed = time.time() - self._last_tx
+                            if elapsed < min_interval:
+                                await asyncio.sleep(min_interval - elapsed)
+
+                        self._last_tx = time.time()
+                        success = await self._send_one(fragment)
+
+                        with self._lock:
+                            self.txb += len(fragment)
+
+                        # Adaptive delay adjustment
+                        if success:
+                            self._current_delay = max(
+                                self.fragment_delay_min,
+                                self._current_delay - self.delay_step_down
+                            )
+                        else:
+                            self._current_delay = min(
+                                self.fragment_delay_max,
+                                self._current_delay * self.delay_backoff_factor
+                            )
+
+                        RNS.log(f"[{self.name}] Adaptive delay: {self._current_delay:.1f}s", RNS.LOG_DEBUG)
+
+                        if self._current_delay > 0:
+                            await asyncio.sleep(self._current_delay)
+
+                self._tx_queue.task_done()
+
+        except asyncio.CancelledError:
+            RNS.log(f"[{self.name}] TX worker cancelled", RNS.LOG_DEBUG)
+        except Exception as e:
+            RNS.log(f"[{self.name}] TX worker error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
+            with self._lock:
+                self.online = False
+
+    async def _send_one(self, data) -> bool:
+        """Send a single fragment once. Returns True on success, False on error."""
+        try:
+            msg_str = base64.b64encode(data).decode("ascii")
+            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+            if result.type == self._event_type_cls.ERROR:
+                RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
+                return False
+            RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
+            return True
         except Exception as e:
             RNS.log(f"[{self.name}] TX failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
-            raise
+            with self._lock:
+                self.online = False
+            return False
 
     def should_ingress_limit(self):
         return False
@@ -557,7 +597,10 @@ class MeshCoreInterface(Interface):
         
         with self._lock:
             self.online = False
-        
+
+        if self._tx_worker_task and not self._tx_worker_task.done():
+            self._tx_worker_task.cancel()
+
         if self.loop and self.loop.is_running():
             if self.mesh:
                 try:

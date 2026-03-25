@@ -66,11 +66,85 @@ Add the following to your `~/.reticulum/config` file:
    # channel_idx =                                        # Leave empty to auto-select, fallback = 39
 
    # === Fragmentation / reliability ===
-   #count_repeat = 7            # How many times to send each fragment (spam to increase chance of delivery)
-   #fragment_timeout = 180       # Timeout for incomplete fragment reassembly (seconds)
-   #fragment_delay = 20         # Delay between fragments in seconds — yes, MeshCore is THAT bad
-   #bitrate = 2000              # Rate limiting in bytes/sec, 0 = unlimited
+   #count_repeat = 1              # Number of full interleaved rounds to send all fragments
+   #fragment_delay = 20           # Starting delay between fragments (seconds), adapts automatically
+   #fragment_delay_min = 2        # Minimum adaptive delay (seconds)
+   #fragment_delay_max = 60       # Maximum adaptive delay (seconds)
+   #delay_step_down = 0.5         # Seconds subtracted from delay on each successful send
+   #delay_backoff_factor = 1.5    # Multiplier applied to delay on each failed send
+   #fragment_timeout = 180        # Timeout for incomplete fragment reassembly (seconds)
+   #bitrate = 2000                # Rate limiting in bytes/sec, 0 = unlimited
 
+```
+
+### Adaptive Delay
+
+The delay between fragment transmissions is no longer fixed. The `fragment_delay` value serves as the **starting point**, and the interface automatically adjusts the effective delay based on link quality:
+
+- **On successful send**: the delay decreases by `delay_step_down` seconds (default 0.5s), down to `fragment_delay_min` (default 2s).
+- **On failed send** (MeshCore returns an error): the delay increases by a factor of `delay_backoff_factor` (default 1.5x), up to `fragment_delay_max` (default 60s).
+- **On reconnection**: the delay resets to the configured `fragment_delay` starting value.
+
+This means the interface will automatically speed up on stable links and back off on noisy or congested ones.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `fragment_delay` | 20 | Starting delay between fragment sends (seconds) |
+| `fragment_delay_min` | 2 | Floor for adaptive delay (seconds) |
+| `fragment_delay_max` | 60 | Ceiling for adaptive delay (seconds) |
+| `delay_step_down` | 0.5 | Seconds subtracted per successful send |
+| `delay_backoff_factor` | 1.5 | Multiplier per failed send |
+| `count_repeat` | 1 | Number of full rounds to send all fragments |
+| `fragment_timeout` | 180 | Seconds before incomplete reassemblies are discarded |
+| `bitrate` | 2000 | Rate limit in bytes/sec (0 = unlimited) |
+
+### Interleaved Repetition
+
+When `count_repeat` is greater than 1, fragments are sent in **full interleaved rounds** rather than per-fragment clusters. For example, with 3 fragments (A, B, C) and `count_repeat = 3`:
+
+- **Before**: A, A, A, B, B, B, C, C, C
+- **Now**: A, B, C, A, B, C, A, B, C
+
+This spreads copies of each fragment across time, making transmission more resilient to burst interference. If a brief radio collision destroys two consecutive sends, it's more likely to lose one copy of two different fragments (recoverable) rather than all copies of the same fragment (not recoverable).
+
+### Example Configurations
+
+**Fast local testing** (TCP transport, low latency):
+```ini
+[[MeshCore]]
+   type = MeshCoreInterface
+   interface_enabled = true
+   transport = tcp
+   host = 127.0.0.1
+   tcp_port = 4403
+   fragment_delay = 2
+   fragment_delay_min = 0.5
+   fragment_delay_max = 10
+```
+
+**Unstable LoRa link** (high repetition, conservative delays):
+```ini
+[[MeshCore]]
+   type = MeshCoreInterface
+   interface_enabled = true
+   transport = ble
+   ble_name = MeshCore-MyNode
+   count_repeat = 3
+   fragment_delay = 30
+   fragment_delay_min = 10
+   fragment_delay_max = 60
+```
+
+**Fixed delay** (disable adaptive behavior, same speed always):
+```ini
+[[MeshCore]]
+   type = MeshCoreInterface
+   interface_enabled = true
+   transport = serial
+   port = /dev/ttyUSB0
+   fragment_delay = 20
+   fragment_delay_min = 20
+   fragment_delay_max = 20
 ```
 
 ## Recent Fixes
@@ -86,6 +160,15 @@ When `count_repeat` is set above 1, every fragment is sent multiple times to imp
 
 ### Corrected documentation defaults
 The example config values for `fragment_timeout` (was 3600, actual default 180) and `bitrate` (was 200, actual default 2000) have been corrected to match the code defaults.
+
+### Non-blocking send queue
+`process_outgoing` previously blocked the RNS thread with `time.sleep()` calls for fragment pacing — a 6-fragment packet at 20s delay would block for over 2 minutes. The send path now uses an async queue: `process_outgoing` returns immediately, and an async worker in the background handles fragmentation, pacing, and transmission without stalling RNS.
+
+### Adaptive fragment delay
+The inter-fragment delay is no longer fixed. It starts at the configured `fragment_delay` value and automatically decreases on successful sends (down to `fragment_delay_min`) or increases on errors (up to `fragment_delay_max`). This allows the interface to find the fastest reliable speed for the current link conditions. See the [Adaptive Delay](#adaptive-delay) section above for configuration details.
+
+### Interleaved repetition
+When `count_repeat > 1`, fragments are now sent in full rounds (A,B,C,A,B,C) instead of per-fragment clusters (A,A,A,B,B,B). This provides better temporal diversity against burst interference on the LoRa medium. See [Interleaved Repetition](#interleaved-repetition) above for details.
 
 ---
 
