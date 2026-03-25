@@ -67,11 +67,27 @@ Add the following to your `~/.reticulum/config` file:
 
    # === Fragmentation / reliability ===
    #count_repeat = 7            # How many times to send each fragment (spam to increase chance of delivery)
-   #fragment_timeout = 3600     # Timeout for incomplete fragment reassembly (seconds)
+   #fragment_timeout = 180       # Timeout for incomplete fragment reassembly (seconds)
    #fragment_delay = 20         # Delay between fragments in seconds — yes, MeshCore is THAT bad
-   #bitrate = 200               # Rate limiting in bytes/sec, 0 = unlimited
+   #bitrate = 2000              # Rate limiting in bytes/sec, 0 = unlimited
 
 ```
+
+## Recent Fixes
+
+### Configurable fragment timeout
+The `fragment_timeout` setting was previously documented but never actually read from config — the timeout was hardcoded to 180 seconds. It is now properly wired up, so users can tune how long incomplete fragment reassemblies are kept in memory before being discarded. This prevents unbounded memory growth on long-running nodes that receive partial transmissions.
+
+### Bitrate limiter
+The bitrate-based pacing between fragments was implemented but the actual delay (`time.sleep`) was commented out, meaning the `bitrate` config setting had no effect. It is now active, enforcing the configured bytes/sec rate limit between fragment transmissions alongside `fragment_delay`.
+
+### Receive-side deduplication
+When `count_repeat` is set above 1, every fragment is sent multiple times to improve delivery probability over unreliable MeshCore links. However, this could cause the same fully-reassembled packet to be delivered to RNS more than once. A deduplication layer now tracks recently received packet hashes and silently drops duplicates within the `fragment_timeout` window.
+
+### Corrected documentation defaults
+The example config values for `fragment_timeout` (was 3600, actual default 180) and `bitrate` (was 200, actual default 2000) have been corrected to match the code defaults.
+
+---
 
 ## Acknowledgements
 

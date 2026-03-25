@@ -70,6 +70,7 @@ class MeshCoreInterface(Interface):
         self.bitrate = int(ifconf.get("bitrate", 2000))
         # 🔑 Задержка между фрагментами в секундах (по умолчанию 0.1 = 100 мс)
         self.fragment_delay = float(ifconf.get("fragment_delay", 20))
+        self.fragment_timeout = int(ifconf.get("fragment_timeout", 180))
         
         # State
         self.online = False
@@ -81,6 +82,7 @@ class MeshCoreInterface(Interface):
         self._fragment_buffers = defaultdict(dict)
         self._fragment_meta = {}
         self._fragment_timestamps = {}
+        self._recent_packets = {}
         
         # MeshCore refs
         self._meshcore_cls = MeshCore
@@ -299,19 +301,35 @@ class MeshCoreInterface(Interface):
                 RNS.log(f"[{self.name}] RX frag: missing chunks {missing}", RNS.LOG_DEBUG)
                 return None
         return None
+
+    def _is_duplicate_packet(self, data: bytes) -> bool:
+        pkt_hash = hashlib.md5(data).hexdigest()
+        now = time.time()
+        if pkt_hash in self._recent_packets and now - self._recent_packets[pkt_hash] < self.fragment_timeout:
+            RNS.log(f"[{self.name}] RX: dropping duplicate packet", RNS.LOG_DEBUG)
+            return True
+        self._recent_packets[pkt_hash] = now
+        return False
+
     async def _rx_raw(self, event):
         try:
             now = time.time()
             with self._lock:
                 expired_keys = [
                     key for key, ts in self._fragment_timestamps.items()
-                    if now - ts > 180
+                    if now - ts > self.fragment_timeout
                 ]
                 for key in expired_keys:
                     RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
                     self._fragment_buffers.pop(key, None)
                     self._fragment_meta.pop(key, None)
                     self._fragment_timestamps.pop(key, None)
+                expired_dedup = [
+                    h for h, ts in self._recent_packets.items()
+                    if now - ts > self.fragment_timeout
+                ]
+                for h in expired_dedup:
+                    del self._recent_packets[h]
 
             print(event)
             data = event.payload
@@ -331,11 +349,14 @@ class MeshCoreInterface(Interface):
             
             if assembled is None:
                 return
-            
+
+            if self._is_duplicate_packet(assembled):
+                return
+
             with self._lock:
                 self.rxb += len(assembled)
             self.owner.inbound(assembled, self)
-            
+
         except Exception as e:
             RNS.log(f"[{self.name}] RX error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
     async def _rx(self, event):
@@ -344,14 +365,20 @@ class MeshCoreInterface(Interface):
             with self._lock:
                 expired_keys = [
                     key for key, ts in self._fragment_timestamps.items()
-                    if now - ts > 180
+                    if now - ts > self.fragment_timeout
                 ]
                 for key in expired_keys:
                     RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
                     self._fragment_buffers.pop(key, None)
                     self._fragment_meta.pop(key, None)
                     self._fragment_timestamps.pop(key, None)
-            
+                expired_dedup = [
+                    h for h, ts in self._recent_packets.items()
+                    if now - ts > self.fragment_timeout
+                ]
+                for h in expired_dedup:
+                    del self._recent_packets[h]
+
             payload = event.payload
             if not isinstance(payload, dict):
                 return
@@ -385,11 +412,14 @@ class MeshCoreInterface(Interface):
             
             if assembled is None:
                 return
-            
+
+            if self._is_duplicate_packet(assembled):
+                return
+
             with self._lock:
                 self.rxb += len(assembled)
             self.owner.inbound(assembled, self)
-            
+
         except Exception as e:
             RNS.log(f"[{self.name}] RX error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
 
@@ -427,7 +457,7 @@ class MeshCoreInterface(Interface):
                 min_interval = len(fragment) / self.bitrate
                 elapsed = now - self._last_tx
                 if elapsed < min_interval:
-                    #time.sleep(min_interval - elapsed)
+                    time.sleep(min_interval - elapsed)
                     now = time.time()
             self._last_tx = now
 
