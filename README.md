@@ -60,9 +60,13 @@ Add the following to your `~/.reticulum/config` file:
    #tcp_port = 4403           # TCP port if transport = tcp
    ble_name = MeshCore-Obdolbus  # BLE device name (optional, auto-scan if empty)
 
-   # === RNS channel settings (DO NOT CHANGE SECRET unless you know what you are doing) ===
+   # === RNS channel settings ===
+   # IMPORTANT: Change channel_secret to a unique value! The default is published
+   # in the source code — anyone using it can read your traffic. Generate one with:
+   #   python3 -c "import os; print(os.urandom(16).hex())"
+   # Then set the SAME secret on ALL your RNS-over-MeshCore nodes.
    # channel_name = RNSTunnel
-   # channel_secret = c4d2b6c8254e3b11200f57e95dcb1197  # 16 bytes hex
+   # channel_secret = <your-unique-16-byte-hex-secret>
    # channel_idx =                                        # Leave empty to auto-select, fallback = 39
 
    # === Fragmentation / reliability ===
@@ -147,6 +151,27 @@ This spreads copies of each fragment across time, making transmission more resil
    fragment_delay_max = 20
 ```
 
+## Security
+
+### Channel Secret
+
+All RNS traffic is encapsulated in a MeshCore channel message encrypted with a shared secret. **Any node that knows the secret can read all tunnelled RNS traffic on that channel.**
+
+The default secret shipped in the source code is publicly known. If you don't change it, your traffic is visible to anyone running this software with default settings. The interface will log a warning on startup if the default secret is detected.
+
+To generate a unique secret:
+```bash
+python3 -c "import os; print(os.urandom(16).hex())"
+```
+
+Set the resulting hex string as `channel_secret` in `~/.reticulum/config` on **all** your RNS-over-MeshCore nodes. They must all use the same secret to communicate.
+
+### Fragment ID Salt
+
+Fragment IDs are salted with 4 bytes of per-session randomness, so the same payload sent in different sessions or from different nodes produces different fragment IDs. This reduces the risk of fragment reassembly corruption from ID collisions across concurrent senders.
+
+---
+
 ## Recent Fixes
 
 ### Configurable fragment timeout
@@ -169,6 +194,12 @@ The inter-fragment delay is no longer fixed. It starts at the configured `fragme
 
 ### Interleaved repetition
 When `count_repeat > 1`, fragments are now sent in full rounds (A,B,C,A,B,C) instead of per-fragment clusters (A,A,A,B,B,B). This provides better temporal diversity against burst interference on the LoRa medium. See [Interleaved Repetition](#interleaved-repetition) above for details.
+
+### Default secret warning
+The interface now logs a prominent warning on startup if the default published channel secret is in use, along with a randomly generated alternative that can be copy-pasted into the config. See [Security](#security) above.
+
+### Per-session fragment ID salt
+Fragment IDs are now salted with 4 bytes of per-session randomness (`os.urandom(4)`), reducing the probability of fragment ID collisions when multiple nodes send the same data or across restarts.
 
 ---
 

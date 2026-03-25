@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib.util
+import os
 import threading
 import time
 import hashlib
@@ -53,7 +54,14 @@ class MeshCoreInterface(Interface):
         self.channel_name = ifconf.get("channel_name", RNS_CHANNEL_NAME)
         secret_hex = ifconf.get("channel_secret", RNS_CHANNEL_SECRET.hex())
         self.channel_secret = bytes.fromhex(secret_hex)
-        
+
+        if self.channel_secret == RNS_CHANNEL_SECRET:
+            suggested = os.urandom(16).hex()
+            RNS.log(f"[{self.name}] WARNING: Using the default published channel secret. "
+                    f"Any node running this software with default settings can read your traffic.", RNS.LOG_WARNING)
+            RNS.log(f"[{self.name}] Generate a unique secret and set it on ALL your nodes:", RNS.LOG_WARNING)
+            RNS.log(f"[{self.name}]   channel_secret = {suggested}", RNS.LOG_WARNING)
+
         configured_idx = ifconf.get("channel_idx")
         self.channel_idx = int(configured_idx) if configured_idx is not None else None
         
@@ -87,6 +95,7 @@ class MeshCoreInterface(Interface):
         self._fragment_meta = {}
         self._fragment_timestamps = {}
         self._recent_packets = {}
+        self._frag_salt = os.urandom(4)
 
         # Async TX queue and worker
         self._tx_queue = None
@@ -274,7 +283,7 @@ class MeshCoreInterface(Interface):
             return [bytes([FLAG_UNFRAGMENTED]) + data]
         
         fragments = []
-        frag_id_bytes = hashlib.md5(data).digest()[:2]
+        frag_id_bytes = hashlib.md5(self._frag_salt + data).digest()[:2]
         total_chunks = (len(data) + FRAGMENT_MTU - 1) // FRAGMENT_MTU
         
         for idx in range(total_chunks):
