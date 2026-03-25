@@ -76,7 +76,7 @@ class MeshCoreInterface(Interface):
         # Interface params
         self.HW_MTU = 564
         self.bitrate = int(ifconf.get("bitrate", 2000))
-        # 🔑 Задержка между фрагментами в секундах (по умолчанию 0.1 = 100 мс)
+        # Delay between fragments in seconds
         self.fragment_delay = float(ifconf.get("fragment_delay", 20))
         self.fragment_timeout = int(ifconf.get("fragment_timeout", 180))
         self.fragment_delay_min = float(ifconf.get("fragment_delay_min", 2.0))
@@ -488,7 +488,7 @@ class MeshCoreInterface(Interface):
             RNS.log(f"[{self.name}] TX queue error: {e}", RNS.LOG_ERROR)
     async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
         """
-        Отправляет сырые байты в канал MeshCore, минуя utf-8 кодирование.
+        Send raw bytes to a MeshCore channel, bypassing utf-8 encoding.
         """
         if timestamp is None:
             import time
@@ -509,7 +509,7 @@ class MeshCoreInterface(Interface):
         return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
     async def _send_raw(self, data: bytes) -> Event:
         """
-        Отправляет сырые байты в эфир
+        Send raw bytes over the air
         """
         
         packet = (
