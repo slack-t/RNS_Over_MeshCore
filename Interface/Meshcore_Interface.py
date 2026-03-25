@@ -71,7 +71,7 @@ class MeshCoreInterface(Interface):
         self.host = ifconf.get("host", "127.0.0.1")
         self.tcp_port = int(ifconf.get("tcp_port", 4403))
         self.ble_name = ifconf.get("ble_name", None)
-        self.count_repeat = ifconf.get("count_repeat", 1)
+        self.count_repeat = int(ifconf.get("count_repeat", 1))
         
         # Interface params
         self.HW_MTU = 564
@@ -473,13 +473,17 @@ class MeshCoreInterface(Interface):
 
     def process_outgoing(self, data):
         """Queue data for async transmission. Non-blocking."""
+        RNS.log(f"[{self.name}] process_outgoing called, {len(data)} bytes", RNS.LOG_DEBUG)
         with self._lock:
             if not self.online or self.mesh is None or self.loop is None:
+                RNS.log(f"[{self.name}] process_outgoing: not ready (online={self.online}, mesh={self.mesh is not None}, loop={self.loop is not None})", RNS.LOG_DEBUG)
                 return
             if self._tx_queue is None:
+                RNS.log(f"[{self.name}] process_outgoing: tx_queue is None", RNS.LOG_DEBUG)
                 return
         try:
             self.loop.call_soon_threadsafe(self._tx_queue.put_nowait, data)
+            RNS.log(f"[{self.name}] process_outgoing: queued {len(data)} bytes", RNS.LOG_DEBUG)
         except Exception as e:
             RNS.log(f"[{self.name}] TX queue error: {e}", RNS.LOG_ERROR)
     async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
@@ -517,9 +521,11 @@ class MeshCoreInterface(Interface):
     
     async def _tx_worker(self):
         """Async worker: drains TX queue, fragments, sends with interleaved repetition and adaptive pacing."""
+        RNS.log(f"[{self.name}] TX worker started", RNS.LOG_DEBUG)
         try:
             while not self.detached:
                 data = await self._tx_queue.get()
+                RNS.log(f"[{self.name}] TX worker got {len(data)} bytes from queue", RNS.LOG_DEBUG)
 
                 with self._lock:
                     if not self.online or self.mesh is None:
