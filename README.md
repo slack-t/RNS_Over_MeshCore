@@ -71,13 +71,16 @@ Add the following to your `~/.reticulum/config` file:
 
    # === Fragmentation / reliability ===
    #count_repeat = 1              # Number of full interleaved rounds to send all fragments
-   #fragment_delay = 20           # Starting delay between fragments (seconds), adapts automatically
-   #fragment_delay_min = 2        # Minimum adaptive delay (seconds)
-   #fragment_delay_max = 60       # Maximum adaptive delay (seconds)
+   #fragment_mtu = 100            # Max payload bytes per fragment (test higher values for speed)
+   #fragment_delay = 3            # Starting delay between fragments (seconds), adapts automatically
+   #fragment_delay_min = 1        # Minimum adaptive delay (seconds)
+   #fragment_delay_max = 30       # Maximum adaptive delay (seconds)
    #delay_step_down = 0.5         # Seconds subtracted from delay on each successful send
    #delay_backoff_factor = 1.5    # Multiplier applied to delay on each failed send
    #fragment_timeout = 180        # Timeout for incomplete fragment reassembly (seconds)
    #bitrate = 2000                # Rate limiting in bytes/sec, 0 = unlimited
+   #opportunistic_sending = false # Send next fragment as soon as previous completes
+   #guard_delay = 0.3             # Minimum gap between sends in opportunistic mode (seconds)
 
 ```
 
@@ -85,22 +88,39 @@ Add the following to your `~/.reticulum/config` file:
 
 The delay between fragment transmissions is no longer fixed. The `fragment_delay` value serves as the **starting point**, and the interface automatically adjusts the effective delay based on link quality:
 
-- **On successful send**: the delay decreases by `delay_step_down` seconds (default 0.5s), down to `fragment_delay_min` (default 2s).
-- **On failed send** (MeshCore returns an error): the delay increases by a factor of `delay_backoff_factor` (default 1.5x), up to `fragment_delay_max` (default 60s).
+- **On successful send**: the delay decreases by `delay_step_down` seconds (default 0.5s), down to `fragment_delay_min` (default 1s).
+- **On failed send** (MeshCore returns an error): the delay increases by a factor of `delay_backoff_factor` (default 1.5x), up to `fragment_delay_max` (default 30s).
 - **On reconnection**: the delay resets to the configured `fragment_delay` starting value.
 
 This means the interface will automatically speed up on stable links and back off on noisy or congested ones.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `fragment_delay` | 20 | Starting delay between fragment sends (seconds) |
-| `fragment_delay_min` | 2 | Floor for adaptive delay (seconds) |
-| `fragment_delay_max` | 60 | Ceiling for adaptive delay (seconds) |
+| `fragment_mtu` | 100 | Max payload bytes per fragment. Higher values = fewer fragments but larger radio packets. Test with your hardware to find the maximum reliable size |
+| `fragment_delay` | 3 | Starting delay between fragment sends (seconds) |
+| `fragment_delay_min` | 1 | Floor for adaptive delay (seconds) |
+| `fragment_delay_max` | 30 | Ceiling for adaptive delay (seconds) |
 | `delay_step_down` | 0.5 | Seconds subtracted per successful send |
 | `delay_backoff_factor` | 1.5 | Multiplier per failed send |
 | `count_repeat` | 1 | Number of full rounds to send all fragments |
 | `fragment_timeout` | 180 | Seconds before incomplete reassemblies are discarded |
 | `bitrate` | 2000 | Rate limit in bytes/sec (0 = unlimited) |
+| `opportunistic_sending` | false | When enabled, sends the next fragment as soon as the previous send completes instead of waiting the full adaptive delay. Falls back to adaptive backoff on errors |
+| `guard_delay` | 0.3 | Minimum gap between fragment sends in opportunistic mode (seconds). Only used when `opportunistic_sending = true` |
+
+### Opportunistic Sending
+
+By default, the interface waits a fixed (adaptive) delay between each fragment send. With `opportunistic_sending = true`, the interface instead sends the next fragment **as soon as the previous `send` call returns**. Since MeshCore's send command blocks until the radio finishes transmitting, the radio's own transmit time acts as natural pacing — no artificial delay needed.
+
+A small `guard_delay` (default 0.3s) prevents overwhelming the device if sends return instantly (e.g., over TCP transport). On errors, the interface falls back to adaptive backoff to avoid flooding a congested link.
+
+This mode is best suited for **reliable links** where MeshCore consistently delivers fragments. On unreliable links, stick with the default adaptive delay mode.
+
+### Fragment MTU
+
+The `fragment_mtu` setting controls how many payload bytes each fragment carries. The default (100 bytes) is conservative. If your MeshCore hardware reliably handles larger channel messages, increasing this reduces the number of fragments (and delay cycles) needed per packet.
+
+For example, a 250-byte RNS announce at `fragment_mtu = 100` requires 3 fragments, but at `fragment_mtu = 200` it fits in 2 — cutting total send time by a third. Test incrementally (150, 200, 250) and watch for send errors in the log.
 
 ### Interleaved Repetition
 
@@ -113,6 +133,18 @@ This spreads copies of each fragment across time, making transmission more resil
 
 ### Example Configurations
 
+**Opportunistic mode** (reliable link, maximum speed):
+```ini
+[[MeshCore]]
+   type = MeshCoreInterface
+   interface_enabled = true
+   transport = serial
+   port = /dev/ttyUSB0
+   opportunistic_sending = true
+   guard_delay = 0.3
+   fragment_mtu = 200
+```
+
 **Fast local testing** (TCP transport, low latency):
 ```ini
 [[MeshCore]]
@@ -121,9 +153,9 @@ This spreads copies of each fragment across time, making transmission more resil
    transport = tcp
    host = 127.0.0.1
    tcp_port = 4403
-   fragment_delay = 2
-   fragment_delay_min = 0.5
-   fragment_delay_max = 10
+   opportunistic_sending = true
+   guard_delay = 0.1
+   fragment_mtu = 200
 ```
 
 **Unstable LoRa link** (high repetition, conservative delays):
@@ -134,9 +166,9 @@ This spreads copies of each fragment across time, making transmission more resil
    transport = ble
    ble_name = MeshCore-MyNode
    count_repeat = 3
-   fragment_delay = 30
-   fragment_delay_min = 10
-   fragment_delay_max = 60
+   fragment_delay = 10
+   fragment_delay_min = 3
+   fragment_delay_max = 30
 ```
 
 **Fixed delay** (disable adaptive behavior, same speed always):
@@ -146,9 +178,9 @@ This spreads copies of each fragment across time, making transmission more resil
    interface_enabled = true
    transport = serial
    port = /dev/ttyUSB0
-   fragment_delay = 20
-   fragment_delay_min = 20
-   fragment_delay_max = 20
+   fragment_delay = 3
+   fragment_delay_min = 3
+   fragment_delay_max = 3
 ```
 
 ## Security

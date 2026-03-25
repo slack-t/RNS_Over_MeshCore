@@ -30,7 +30,7 @@ RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 # =============================================================================
 FLAG_UNFRAGMENTED = 0xFE
 FLAG_FRAGMENTED = 0xFF
-FRAGMENT_MTU = 100
+FRAGMENT_MTU_DEFAULT = 100
 FRAGMENT_HEADER_SIZE = 5
 
 class MeshCoreInterface(Interface):
@@ -72,17 +72,22 @@ class MeshCoreInterface(Interface):
         self.tcp_port = int(ifconf.get("tcp_port", 4403))
         self.ble_name = ifconf.get("ble_name", None)
         self.count_repeat = int(ifconf.get("count_repeat", 1))
-        
+
         # Interface params
         self.HW_MTU = 564
         self.bitrate = int(ifconf.get("bitrate", 2000))
+        self.fragment_mtu = int(ifconf.get("fragment_mtu", FRAGMENT_MTU_DEFAULT))
         # Delay between fragments in seconds
-        self.fragment_delay = float(ifconf.get("fragment_delay", 20))
+        self.fragment_delay = float(ifconf.get("fragment_delay", 3))
         self.fragment_timeout = int(ifconf.get("fragment_timeout", 180))
-        self.fragment_delay_min = float(ifconf.get("fragment_delay_min", 2.0))
-        self.fragment_delay_max = float(ifconf.get("fragment_delay_max", 60.0))
+        self.fragment_delay_min = float(ifconf.get("fragment_delay_min", 1.0))
+        self.fragment_delay_max = float(ifconf.get("fragment_delay_max", 30.0))
         self.delay_step_down = float(ifconf.get("delay_step_down", 0.5))
         self.delay_backoff_factor = float(ifconf.get("delay_backoff_factor", 1.5))
+        # Opportunistic sending: send next fragment as soon as previous completes
+        # instead of waiting the full adaptive delay. Uses guard_delay as minimum gap.
+        self.opportunistic_sending = str(ifconf.get("opportunistic_sending", "false")).lower() == "true"
+        self.guard_delay = float(ifconf.get("guard_delay", 0.3))
         
         # State
         self.online = False
@@ -246,7 +251,8 @@ class MeshCoreInterface(Interface):
         with self._lock:
             self.online = True
         
-        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx})", RNS.LOG_INFO)
+        mode = "opportunistic" if self.opportunistic_sending else f"adaptive (delay={self.fragment_delay}s)"
+        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx}, mtu={self.fragment_mtu}, mode={mode})", RNS.LOG_INFO)
 
         # Start async TX queue and worker
         if self._tx_worker_task and not self._tx_worker_task.done():
@@ -279,21 +285,22 @@ class MeshCoreInterface(Interface):
         return await self._meshcore_cls.create_ble()
 
     def _fragment_outgoing(self, data):
-        if len(data) <= FRAGMENT_MTU:
+        mtu = self.fragment_mtu
+        if len(data) <= mtu:
             return [bytes([FLAG_UNFRAGMENTED]) + data]
-        
+
         fragments = []
         frag_id_bytes = hashlib.md5(self._frag_salt + data).digest()[:2]
-        total_chunks = (len(data) + FRAGMENT_MTU - 1) // FRAGMENT_MTU
-        
+        total_chunks = (len(data) + mtu - 1) // mtu
+
         for idx in range(total_chunks):
-            start = idx * FRAGMENT_MTU
-            end = min(start + FRAGMENT_MTU, len(data))
+            start = idx * mtu
+            end = min(start + mtu, len(data))
             chunk = data[start:end]
-            
+
             header = bytes([FLAG_FRAGMENTED]) + frag_id_bytes + bytes([idx, total_chunks])
             fragments.append(header + chunk)
-        
+
         return fragments
 
     def _reassemble_fragment(self, payload: bytes):
@@ -551,27 +558,43 @@ class MeshCoreInterface(Interface):
                                 await asyncio.sleep(min_interval - elapsed)
 
                         self._last_tx = time.time()
+                        tx_start = time.time()
                         success = await self._send_one(fragment)
+                        tx_elapsed = time.time() - tx_start
 
                         with self._lock:
                             self.txb += len(fragment)
 
-                        # Adaptive delay adjustment
-                        if success:
-                            self._current_delay = max(
-                                self.fragment_delay_min,
-                                self._current_delay - self.delay_step_down
-                            )
+                        if self.opportunistic_sending:
+                            # Send-completion based pacing: the MeshCore send call
+                            # blocks until the radio finishes, so that time already
+                            # acts as natural pacing. Only add a small guard delay.
+                            if success:
+                                remaining = self.guard_delay - tx_elapsed
+                                if remaining > 0:
+                                    await asyncio.sleep(remaining)
+                            else:
+                                # Back off on failure even in opportunistic mode
+                                self._current_delay = min(
+                                    self.fragment_delay_max,
+                                    self._current_delay * self.delay_backoff_factor
+                                )
+                                await asyncio.sleep(self._current_delay)
                         else:
-                            self._current_delay = min(
-                                self.fragment_delay_max,
-                                self._current_delay * self.delay_backoff_factor
-                            )
-
-                        RNS.log(f"[{self.name}] Adaptive delay: {self._current_delay:.1f}s", RNS.LOG_DEBUG)
-
-                        if self._current_delay > 0:
-                            await asyncio.sleep(self._current_delay)
+                            # Standard adaptive delay
+                            if success:
+                                self._current_delay = max(
+                                    self.fragment_delay_min,
+                                    self._current_delay - self.delay_step_down
+                                )
+                            else:
+                                self._current_delay = min(
+                                    self.fragment_delay_max,
+                                    self._current_delay * self.delay_backoff_factor
+                                )
+                            RNS.log(f"[{self.name}] Adaptive delay: {self._current_delay:.1f}s", RNS.LOG_DEBUG)
+                            if self._current_delay > 0:
+                                await asyncio.sleep(self._current_delay)
 
                 self._tx_queue.task_done()
 
