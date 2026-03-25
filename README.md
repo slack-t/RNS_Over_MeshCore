@@ -81,6 +81,7 @@ Add the following to your `~/.reticulum/config` file:
    #bitrate = 2000                # Rate limiting in bytes/sec, 0 = unlimited
    #opportunistic_sending = false # Send next fragment as soon as previous completes
    #guard_delay = 0.3             # Minimum gap between sends in opportunistic mode (seconds)
+   #raw_encoding = false          # Use raw binary (latin-1) instead of base64, saves 33% bandwidth
 
 ```
 
@@ -107,6 +108,7 @@ This means the interface will automatically speed up on stable links and back of
 | `bitrate` | 2000 | Rate limit in bytes/sec (0 = unlimited) |
 | `opportunistic_sending` | false | When enabled, sends the next fragment as soon as the previous send completes instead of waiting the full adaptive delay. Falls back to adaptive backoff on errors |
 | `guard_delay` | 0.3 | Minimum gap between fragment sends in opportunistic mode (seconds). Only used when `opportunistic_sending = true` |
+| `raw_encoding` | false | Send fragments as raw binary (latin-1) instead of base64. Eliminates 33% encoding overhead, allowing ~128 bytes per fragment instead of 100. Both sides must use the same setting. Falls back to the other encoding on decode failure |
 
 ### Opportunistic Sending
 
@@ -115,6 +117,14 @@ By default, the interface waits a fixed (adaptive) delay between each fragment s
 A small `guard_delay` (default 0.3s) prevents overwhelming the device if sends return instantly (e.g., over TCP transport). On errors, the interface falls back to adaptive backoff to avoid flooding a congested link.
 
 This mode is best suited for **reliable links** where MeshCore consistently delivers fragments. On unreliable links, stick with the default adaptive delay mode.
+
+### Raw Encoding
+
+By default, fragments are base64-encoded before being sent as MeshCore channel messages. This is safe but adds ~33% overhead — a 100-byte fragment becomes ~136 characters.
+
+With `raw_encoding = true`, fragments are sent as raw binary using latin-1 encoding (a 1:1 byte-to-character mapping with zero overhead). This allows the full ~133-byte MeshCore channel message limit to carry actual payload data instead of wasting a third on encoding.
+
+**Important:** Both sending and receiving nodes should use the same setting. The receiver attempts both encodings with fallback, so a mixed network will still work, but matched settings are more efficient.
 
 ### Fragment MTU
 
@@ -142,7 +152,8 @@ This spreads copies of each fragment across time, making transmission more resil
    port = /dev/ttyUSB0
    opportunistic_sending = true
    guard_delay = 0.3
-   fragment_mtu = 200
+   raw_encoding = true
+   fragment_mtu = 120
 ```
 
 **Fast local testing** (TCP transport, low latency):
@@ -155,7 +166,8 @@ This spreads copies of each fragment across time, making transmission more resil
    tcp_port = 4403
    opportunistic_sending = true
    guard_delay = 0.1
-   fragment_mtu = 200
+   raw_encoding = true
+   fragment_mtu = 120
 ```
 
 **Unstable LoRa link** (high repetition, conservative delays):

@@ -88,7 +88,10 @@ class MeshCoreInterface(Interface):
         # instead of waiting the full adaptive delay. Uses guard_delay as minimum gap.
         self.opportunistic_sending = str(ifconf.get("opportunistic_sending", "false")).lower() == "true"
         self.guard_delay = float(ifconf.get("guard_delay", 0.3))
-        
+        # Raw encoding: send binary via latin-1 instead of base64, eliminating 33% overhead.
+        # Both sides must use the same setting. Increases effective payload per fragment.
+        self.raw_encoding = str(ifconf.get("raw_encoding", "false")).lower() == "true"
+
         # State
         self.online = False
         self.detached = False
@@ -252,7 +255,8 @@ class MeshCoreInterface(Interface):
             self.online = True
         
         mode = "opportunistic" if self.opportunistic_sending else f"adaptive (delay={self.fragment_delay}s)"
-        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx}, mtu={self.fragment_mtu}, mode={mode})", RNS.LOG_INFO)
+        encoding = "raw/latin-1" if self.raw_encoding else "base64"
+        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx}, mtu={self.fragment_mtu}, mode={mode}, encoding={encoding})", RNS.LOG_INFO)
 
         # Start async TX queue and worker
         if self._tx_worker_task and not self._tx_worker_task.done():
@@ -347,6 +351,37 @@ class MeshCoreInterface(Interface):
         self._recent_packets[pkt_hash] = now
         return False
 
+    def _decode_rx(self, msg_str: str) -> bytes:
+        """Decode received message text to bytes. Tries raw latin-1 or base64
+        depending on config, with fallback to the other encoding."""
+        if self.raw_encoding:
+            # Raw mode: try latin-1 first, then fall back to base64
+            try:
+                data = msg_str.encode("latin-1")
+                if len(data) >= 1 and data[0] in (FLAG_UNFRAGMENTED, FLAG_FRAGMENTED):
+                    return data
+            except Exception:
+                pass
+            try:
+                return base64.b64decode(msg_str, validate=True)
+            except Exception as e:
+                RNS.log(f"[{self.name}] RX decode failed (raw mode): {e}", RNS.LOG_WARNING)
+                return None
+        else:
+            # Base64 mode: try base64 first, then fall back to latin-1
+            try:
+                return base64.b64decode(msg_str, validate=True)
+            except Exception:
+                pass
+            try:
+                data = msg_str.encode("latin-1")
+                if len(data) >= 1 and data[0] in (FLAG_UNFRAGMENTED, FLAG_FRAGMENTED):
+                    return data
+            except Exception:
+                pass
+            RNS.log(f"[{self.name}] RX decode failed (base64 mode)", RNS.LOG_WARNING)
+            return None
+
     async def _rx_raw(self, event):
         try:
             now = time.time()
@@ -433,11 +468,9 @@ class MeshCoreInterface(Interface):
             RNS.log(f"[{self.name}] RX raw text: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
             msg_str = self._remove_node_name_from_msg(msg_str)
             RNS.log(f"[{self.name}] RX after name removal: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
-            #print(f"DEBUG {msg_str}")
-            try:
-                data = base64.b64decode(msg_str, validate=True)
-            except Exception as e:
-                RNS.log(f"[{self.name}] RX invalid base64: {e}", RNS.LOG_WARNING)
+
+            data = self._decode_rx(msg_str)
+            if data is None:
                 return
             
             if len(data) < 1:
@@ -608,8 +641,12 @@ class MeshCoreInterface(Interface):
     async def _send_one(self, data) -> bool:
         """Send a single fragment once. Returns True on success, False on error."""
         try:
-            msg_str = base64.b64encode(data).decode("ascii")
-            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+            if self.raw_encoding:
+                msg_str = data.decode("latin-1")
+                result = await self._send_channel_raw(self.channel_idx, msg_str)
+            else:
+                msg_str = base64.b64encode(data).decode("ascii")
+                result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
             if result.type == self._event_type_cls.ERROR:
                 RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
                 return False
