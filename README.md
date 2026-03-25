@@ -251,6 +251,8 @@ Fragment IDs are now salted with 4 bytes of per-session randomness (`os.urandom(
 
 Special thanks to [HDDen](https://github.com/HDDen/) for their help with the MeshCore integration and debugging.
 
+Thank you [terminator513](https://github.com/terminator513/) for the initial work on this!
+
 ## License
 
 MIT License — See LICENSE file for details.
