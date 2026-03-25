@@ -409,16 +409,23 @@ class MeshCoreInterface(Interface):
                     del self._recent_packets[h]
 
             payload = event.payload
+            RNS.log(f"[{self.name}] RX event received, payload type: {type(payload).__name__}, payload: {repr(payload)[:200]}", RNS.LOG_DEBUG)
             if not isinstance(payload, dict):
+                RNS.log(f"[{self.name}] RX: payload is not dict, ignoring", RNS.LOG_DEBUG)
                 return
-            
-            if payload.get("channel_idx") != self.channel_idx:
+
+            rx_chan = payload.get("channel_idx")
+            RNS.log(f"[{self.name}] RX: channel_idx={rx_chan} (expected {self.channel_idx}), type={type(rx_chan).__name__}", RNS.LOG_DEBUG)
+            if rx_chan != self.channel_idx:
                 return
-            
+
             msg_str = payload.get("text")
             if not msg_str:
+                RNS.log(f"[{self.name}] RX: no 'text' in payload", RNS.LOG_DEBUG)
                 return
+            RNS.log(f"[{self.name}] RX raw text: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
             msg_str = self._remove_node_name_from_msg(msg_str)
+            RNS.log(f"[{self.name}] RX after name removal: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
             #print(f"DEBUG {msg_str}")
             try:
                 data = base64.b64decode(msg_str, validate=True)
