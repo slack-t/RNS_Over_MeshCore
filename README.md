@@ -81,6 +81,7 @@ Add the following to your `~/.reticulum/config` file:
    #bitrate = 2000                # Rate limiting in bytes/sec, 0 = unlimited
    #opportunistic_sending = false # Send next fragment as soon as previous completes
    #guard_delay = 0.3             # Minimum gap between sends in opportunistic mode (seconds)
+   #flood_scope =                 # Limit propagation to repeaters allowing this scope (requires firmware >1.14)
 
 ```
 
@@ -107,6 +108,7 @@ This means the interface will automatically speed up on stable links and back of
 | `bitrate` | 2000 | Rate limit in bytes/sec (0 = unlimited) |
 | `opportunistic_sending` | false | When enabled, sends the next fragment as soon as the previous send completes instead of waiting the full adaptive delay. Falls back to adaptive backoff on errors |
 | `guard_delay` | 0.3 | Minimum gap between fragment sends in opportunistic mode (seconds). Only used when `opportunistic_sending = true` |
+| `flood_scope` | *(none)* | Limit message propagation to repeaters that allow this scope string. Requires MeshCore firmware >1.14. Repeaters must be configured with the same scope via `region` CLI commands |
 
 ### Opportunistic Sending
 
@@ -121,6 +123,25 @@ This mode is best suited for **reliable links** where MeshCore consistently deli
 The `fragment_mtu` setting controls how many payload bytes each fragment carries. The default (100 bytes) is conservative. If your MeshCore hardware reliably handles larger channel messages, increasing this reduces the number of fragments (and delay cycles) needed per packet.
 
 For example, a 250-byte RNS announce at `fragment_mtu = 100` requires 3 fragments, but at `fragment_mtu = 200` it fits in 2 — cutting total send time by a third. Test incrementally (150, 200, 250) and watch for send errors in the log.
+
+### Flood Scope
+
+MeshCore firmware >1.14 supports **region scopes** that limit which repeaters relay flood messages. By setting `flood_scope`, the interface tags all outgoing messages with a scope identifier. Only repeaters configured to allow that scope will forward the traffic.
+
+This is useful to prevent RNS tunnel traffic from flooding the entire MeshCore mesh — only repeaters that explicitly opt in will relay it.
+
+**Node configuration** (in `~/.reticulum/config`):
+```ini
+flood_scope = rnstunnel
+```
+
+**Repeater configuration** (via MeshCore CLI on each repeater):
+```
+region put rnstunnel
+region allowf rnstunnel
+```
+
+All RNS nodes must use the same `flood_scope` value, and all repeaters in the path must allow that scope. If `flood_scope` is not set, messages use standard flood routing with no scope restriction.
 
 ### Interleaved Repetition
 

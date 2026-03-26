@@ -88,6 +88,9 @@ class MeshCoreInterface(Interface):
         # instead of waiting the full adaptive delay. Uses guard_delay as minimum gap.
         self.opportunistic_sending = str(ifconf.get("opportunistic_sending", "false")).lower() == "true"
         self.guard_delay = float(ifconf.get("guard_delay", 0.3))
+        # Flood scope: limit message propagation to repeaters allowing this scope.
+        # Repeaters must be configured to allow the same scope string.
+        self.flood_scope = ifconf.get("flood_scope", None)
 
         # State
         self.online = False
@@ -240,19 +243,27 @@ class MeshCoreInterface(Interface):
         if not await self._ensure_channel():
             raise IOError("Failed to configure any channel for RNS")
 
+        if self.flood_scope:
+            result = await self.mesh.commands.set_flood_scope(self.flood_scope)
+            if result.type == self._event_type_cls.ERROR:
+                RNS.log(f"[{self.name}] Failed to set flood scope '{self.flood_scope}': {result.payload}", RNS.LOG_ERROR)
+            else:
+                RNS.log(f"[{self.name}] Flood scope set to '{self.flood_scope}'", RNS.LOG_INFO)
+
         #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx_raw)
 
         self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
-        
+
         await self.mesh.start_auto_message_fetching()
-        
+
         with self._lock:
             self.online = True
-        
+
         mode = "opportunistic" if self.opportunistic_sending else f"adaptive (delay={self.fragment_delay}s)"
-        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx}, mtu={self.fragment_mtu}, mode={mode})", RNS.LOG_INFO)
+        scope_info = f", scope={self.flood_scope}" if self.flood_scope else ""
+        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx}, mtu={self.fragment_mtu}, mode={mode}{scope_info})", RNS.LOG_INFO)
 
         # Start async TX queue and worker
         if self._tx_worker_task and not self._tx_worker_task.done():
@@ -647,6 +658,11 @@ class MeshCoreInterface(Interface):
 
         if self.loop and self.loop.is_running():
             if self.mesh:
+                if self.flood_scope:
+                    try:
+                        asyncio.run_coroutine_threadsafe(self.mesh.commands.set_flood_scope(None), self.loop)
+                    except Exception:
+                        pass
                 try:
                     asyncio.run_coroutine_threadsafe(self.mesh.disconnect(), self.loop)
                 except Exception as e:
