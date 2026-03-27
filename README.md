@@ -97,7 +97,7 @@ This means the interface will automatically speed up on stable links and back of
 
 | Parameter | Default | Description |
 |---|---|---|
-| `fragment_mtu` | 102 | Max payload bytes per fragment. Do not exceed 102 if you want repeater forwarding (base85 + 4-byte header = 106 bytes = 133 chars exactly) |
+| `fragment_mtu` | 101 | Max payload bytes per fragment. Do not exceed 101 — base85(105 bytes) = 132 chars (safe limit). 102 bytes = 133 chars and will be dropped by repeaters |
 | `fragment_delay` | 3 | Starting delay between fragment sends (seconds) |
 | `fragment_delay_min` | 1 | Floor for adaptive delay (seconds) |
 | `fragment_delay_max` | 30 | Ceiling for adaptive delay (seconds) |
@@ -122,11 +122,11 @@ This mode is best suited for **reliable links** where MeshCore consistently deli
 
 The `fragment_mtu` setting controls how many payload bytes each fragment carries.
 
-**Encoding:** Fragments are encoded with base85 (RFC 1924), which has 25% overhead versus base64's 33%. MeshCore channel messages have a ~133-character text limit. base85(106 bytes) = exactly 133 chars. The 4-byte V2 fragment header uses 4 of those bytes, leaving **102 bytes max payload** that repeaters will forward. The default is set to 102.
+**Encoding:** Fragments are encoded with base85 (RFC 1924), which has 25% overhead versus base64's 33%. MeshCore channel messages have a safe limit of **132 characters** for repeater forwarding. base85(105 bytes) = exactly 132 chars — matching the old base64 limit. The 4-byte V2 fragment header uses 4 of those bytes, leaving **101 bytes max payload**. The default is set to 101.
 
-Do not increase `fragment_mtu` above 102 if you want fragments to be relayed by repeaters. Higher values will work for direct node-to-node links but will be silently dropped by repeaters.
+Do not increase `fragment_mtu` above 101 if you want fragments to be relayed by repeaters. 102 bytes encodes to 133 chars and will be silently dropped by repeaters.
 
-The V2 fragment header supports up to 16 fragments per packet. With `fragment_mtu = 102` and RNS's 500-byte MTU, a maximum packet requires 5 fragments — well within this limit. Only reduce `fragment_mtu` below ~32 if you need more than 16 fragments, which should never be necessary in practice.
+The V2 fragment header supports up to 16 fragments per packet. With `fragment_mtu = 101` and RNS's 500-byte MTU, a maximum packet requires 5 fragments — well within this limit.
 
 ### Flood Scope
 
@@ -232,7 +232,7 @@ Fragment IDs are salted with 4 bytes of per-session randomness, so the same payl
 ### base85 encoding and compact V2 fragment header
 Fragments are now encoded with **base85** (Python stdlib `base64.b85encode`) instead of base64. base85 has 25% overhead versus base64's 33%, and the V2 fragment header is 4 bytes (down from 5) using nibble-packed chunk index and total count.
 
-Combined effect: **102 bytes of payload per fragment** instead of 94 — an 8.5% improvement. base85(106 bytes) = exactly 133 characters, which is the MeshCore repeater forwarding limit. The V2 header (`FLAG_FRAGMENTED_V2 = 0xFD`) supports up to 16 fragments per packet, which is sufficient for all normal RNS traffic with the default MTU.
+Combined effect: **101 bytes of payload per fragment** instead of 94 — a 7.4% improvement. base85(105 bytes) = exactly 132 characters, which matches the MeshCore safe repeater forwarding limit. The V2 header (`FLAG_FRAGMENTED_V2 = 0xFD`) supports up to 16 fragments per packet, which is sufficient for all normal RNS traffic with the default MTU.
 
 **Note:** This is a protocol change. All nodes on the same channel must run the same version. V1 (base64) nodes cannot decode V2 (base85) messages and vice versa. The receiver still accepts V1 fragmented packets for diagnostic purposes.
 

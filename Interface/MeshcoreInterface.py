@@ -31,10 +31,11 @@ RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 FLAG_UNFRAGMENTED = 0xFE
 FLAG_FRAGMENTED = 0xFF      # V1: 5-byte header (legacy receive only)
 FLAG_FRAGMENTED_V2 = 0xFD   # V2: 4-byte compact header, nibble-packed idx/total
-# base85(106 bytes) = 133 chars exactly, fits within MeshCore's 133-char limit
+# MeshCore channel messages have a <=132 char safe limit for repeater forwarding.
+# base85(105 bytes) = 132 chars exactly (= old base64(99 bytes) = 132 chars).
 # V2 header: 4 bytes (FLAG + FRAG_ID[2] + packed byte: high nibble=idx, low nibble=total-1)
-# Payload per fragment: 106 - 4 = 102 bytes (vs 94 bytes with base64+V1 header: +8.5%)
-FRAGMENT_MTU_DEFAULT = 102
+# Payload per fragment: 105 - 4 = 101 bytes (vs 94 bytes with base64+V1 header: +7.4%)
+FRAGMENT_MTU_DEFAULT = 101
 FRAGMENT_HEADER_SIZE_V1 = 5
 FRAGMENT_HEADER_SIZE_V2 = 4
 
