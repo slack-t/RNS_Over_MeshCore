@@ -29,9 +29,14 @@ RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 # FRAGMENTATION PARAMETERS
 # =============================================================================
 FLAG_UNFRAGMENTED = 0xFE
-FLAG_FRAGMENTED = 0xFF
-FRAGMENT_MTU_DEFAULT = 94  # base64(94+5 header=99 bytes)=132 chars, fits within MeshCore's 133-char limit
-FRAGMENT_HEADER_SIZE = 5
+FLAG_FRAGMENTED = 0xFF      # V1: 5-byte header (legacy receive only)
+FLAG_FRAGMENTED_V2 = 0xFD   # V2: 4-byte compact header, nibble-packed idx/total
+# base85(106 bytes) = 133 chars exactly, fits within MeshCore's 133-char limit
+# V2 header: 4 bytes (FLAG + FRAG_ID[2] + packed byte: high nibble=idx, low nibble=total-1)
+# Payload per fragment: 106 - 4 = 102 bytes (vs 94 bytes with base64+V1 header: +8.5%)
+FRAGMENT_MTU_DEFAULT = 102
+FRAGMENT_HEADER_SIZE_V1 = 5
+FRAGMENT_HEADER_SIZE_V2 = 4
 
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
@@ -74,7 +79,7 @@ class MeshCoreInterface(Interface):
         self.count_repeat = int(ifconf.get("count_repeat", 1))
 
         # Interface params
-        self.HW_MTU = 564
+        self.HW_MTU = 500
         self.bitrate = int(ifconf.get("bitrate", 2000))
         self.fragment_mtu = int(ifconf.get("fragment_mtu", FRAGMENT_MTU_DEFAULT))
         # Delay between fragments in seconds
@@ -304,12 +309,22 @@ class MeshCoreInterface(Interface):
         frag_id_bytes = hashlib.md5(self._frag_salt + data).digest()[:2]
         total_chunks = (len(data) + mtu - 1) // mtu
 
+        if total_chunks > 16:
+            RNS.log(
+                f"[{self.name}] TX: packet ({len(data)}B) requires {total_chunks} fragments "
+                f"but V2 header supports max 16 — increase fragment_mtu (current={mtu})",
+                RNS.LOG_ERROR,
+            )
+            return []
+
         for idx in range(total_chunks):
             start = idx * mtu
             end = min(start + mtu, len(data))
             chunk = data[start:end]
-
-            header = bytes([FLAG_FRAGMENTED]) + frag_id_bytes + bytes([idx, total_chunks])
+            # V2 compact header: 4 bytes
+            # packed byte: high nibble = chunk index (0-15), low nibble = total_chunks-1 (0-15)
+            packed = (idx << 4) | (total_chunks - 1)
+            header = bytes([FLAG_FRAGMENTED_V2]) + frag_id_bytes + bytes([packed])
             fragments.append(header + chunk)
 
         return fragments
@@ -347,6 +362,41 @@ class MeshCoreInterface(Interface):
                 missing = expected_indices - meta["received"]
                 RNS.log(f"[{self.name}] RX frag: missing chunks {missing}", RNS.LOG_DEBUG)
                 return None
+        return None
+
+    def _reassemble_fragment_v2(self, payload: bytes):
+        """V2 compact header: FRAG_ID[2] + packed byte (high nibble=idx, low nibble=total-1) + data"""
+        if len(payload) < 4:
+            return None
+        frag_id_key = payload[0:2].hex()
+        packed = payload[2]
+        chunk_idx = (packed >> 4) & 0x0F
+        total_chunks = (packed & 0x0F) + 1
+        chunk_data = payload[3:]
+
+        if chunk_idx >= total_chunks:
+            RNS.log(f"[{self.name}] RX V2: invalid fragment idx={chunk_idx} total={total_chunks}", RNS.LOG_WARNING)
+            return None
+
+        key = frag_id_key
+        if key not in self._fragment_meta:
+            self._fragment_meta[key] = {"total": total_chunks, "received": set()}
+            self._fragment_buffers[key] = {}
+            self._fragment_timestamps[key] = time.time()
+
+        meta = self._fragment_meta[key]
+        buf = self._fragment_buffers[key]
+        buf[chunk_idx] = chunk_data
+        meta["received"].add(chunk_idx)
+
+        if len(meta["received"]) == meta["total"]:
+            expected = set(range(meta["total"]))
+            if meta["received"] == expected:
+                assembled = b"".join(buf[i] for i in range(meta["total"]))
+                del self._fragment_buffers[key]
+                del self._fragment_meta[key]
+                del self._fragment_timestamps[key]
+                return assembled
         return None
 
     def _is_duplicate_packet(self, data: bytes) -> bool:
@@ -427,37 +477,33 @@ class MeshCoreInterface(Interface):
                     del self._recent_packets[h]
 
             payload = event.payload
-            RNS.log(f"[{self.name}] RX event received, payload type: {type(payload).__name__}, payload: {repr(payload)[:200]}", RNS.LOG_DEBUG)
             if not isinstance(payload, dict):
-                RNS.log(f"[{self.name}] RX: payload is not dict, ignoring", RNS.LOG_DEBUG)
                 return
 
             rx_chan = payload.get("channel_idx")
-            RNS.log(f"[{self.name}] RX: channel_idx={rx_chan} (expected {self.channel_idx}), type={type(rx_chan).__name__}", RNS.LOG_DEBUG)
             if rx_chan != self.channel_idx:
                 return
 
             msg_str = payload.get("text")
             if not msg_str:
-                RNS.log(f"[{self.name}] RX: no 'text' in payload", RNS.LOG_DEBUG)
                 return
-            RNS.log(f"[{self.name}] RX raw text: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
             msg_str = self._remove_node_name_from_msg(msg_str)
-            RNS.log(f"[{self.name}] RX after name removal: {repr(msg_str)[:200]}", RNS.LOG_DEBUG)
             try:
-                data = base64.b64decode(msg_str, validate=True)
+                data = base64.b85decode(msg_str)
             except Exception as e:
-                RNS.log(f"[{self.name}] RX invalid base64: {e}", RNS.LOG_WARNING)
+                RNS.log(f"[{self.name}] RX invalid base85: {e}", RNS.LOG_WARNING)
                 return
-            
+
             if len(data) < 1:
                 return
-            
+
             flags = data[0]
             mesh_payload = data[1:]
-            
+
             if flags == FLAG_UNFRAGMENTED:
                 assembled = mesh_payload
+            elif flags == FLAG_FRAGMENTED_V2:
+                assembled = self._reassemble_fragment_v2(mesh_payload)
             elif flags == FLAG_FRAGMENTED:
                 assembled = self._reassemble_fragment(mesh_payload)
             else:
@@ -497,17 +543,11 @@ class MeshCoreInterface(Interface):
 
     def process_outgoing(self, data):
         """Queue data for async transmission. Non-blocking."""
-        RNS.log(f"[{self.name}] process_outgoing called, {len(data)} bytes", RNS.LOG_DEBUG)
         with self._lock:
-            if not self.online or self.mesh is None or self.loop is None:
-                RNS.log(f"[{self.name}] process_outgoing: not ready (online={self.online}, mesh={self.mesh is not None}, loop={self.loop is not None})", RNS.LOG_DEBUG)
-                return
-            if self._tx_queue is None:
-                RNS.log(f"[{self.name}] process_outgoing: tx_queue is None", RNS.LOG_DEBUG)
+            if not self.online or self.mesh is None or self.loop is None or self._tx_queue is None:
                 return
         try:
             self.loop.call_soon_threadsafe(self._tx_queue.put_nowait, data)
-            RNS.log(f"[{self.name}] process_outgoing: queued {len(data)} bytes", RNS.LOG_DEBUG)
         except Exception as e:
             RNS.log(f"[{self.name}] TX queue error: {e}", RNS.LOG_ERROR)
     async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
@@ -545,11 +585,9 @@ class MeshCoreInterface(Interface):
     
     async def _tx_worker(self):
         """Async worker: drains TX queue, fragments, sends with interleaved repetition and adaptive pacing."""
-        RNS.log(f"[{self.name}] TX worker started", RNS.LOG_DEBUG)
         try:
             while not self.detached:
                 data = await self._tx_queue.get()
-                RNS.log(f"[{self.name}] TX worker got {len(data)} bytes from queue", RNS.LOG_DEBUG)
 
                 with self._lock:
                     if not self.online or self.mesh is None:
@@ -602,14 +640,13 @@ class MeshCoreInterface(Interface):
                                     self.fragment_delay_max,
                                     self._current_delay * self.delay_backoff_factor
                                 )
-                            RNS.log(f"[{self.name}] Adaptive delay: {self._current_delay:.1f}s", RNS.LOG_DEBUG)
                             if self._current_delay > 0:
                                 await asyncio.sleep(self._current_delay)
 
                 self._tx_queue.task_done()
 
         except asyncio.CancelledError:
-            RNS.log(f"[{self.name}] TX worker cancelled", RNS.LOG_DEBUG)
+            pass
         except Exception as e:
             RNS.log(f"[{self.name}] TX worker error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
             with self._lock:
@@ -618,12 +655,11 @@ class MeshCoreInterface(Interface):
     async def _send_one(self, data) -> bool:
         """Send a single fragment once. Returns True on success, False on error."""
         try:
-            msg_str = base64.b64encode(data).decode("ascii")
+            msg_str = base64.b85encode(data).decode("ascii")
             result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
             if result.type == self._event_type_cls.ERROR:
                 RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
                 return False
-            RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
             return True
         except Exception as e:
             RNS.log(f"[{self.name}] TX failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
@@ -645,7 +681,7 @@ class MeshCoreInterface(Interface):
         else:
             location = "unknown"
         chan_str = f"{self.channel_idx}" if self.channel_idx is not None else "auto"
-        return f"{self.name}: {status}, {self.transport}://{location}, channel={chan_str}, MTU={self.HW_MTU} (frag={FRAGMENT_MTU})"
+        return f"{self.name}: {status}, {self.transport}://{location}, channel={chan_str}, MTU={self.HW_MTU} (frag={self.fragment_mtu})"
 
     def detach(self):
         self.detached = True
