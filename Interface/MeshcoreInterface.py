@@ -30,7 +30,7 @@ RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 # =============================================================================
 FLAG_UNFRAGMENTED = 0xFE
 FLAG_FRAGMENTED = 0xFF
-FRAGMENT_MTU_DEFAULT = 100
+FRAGMENT_MTU_DEFAULT = 94  # base64(94+5 header=99 bytes)=132 chars, fits within MeshCore's 133-char limit
 FRAGMENT_HEADER_SIZE = 5
 
 class MeshCoreInterface(Interface):
@@ -249,10 +249,6 @@ class MeshCoreInterface(Interface):
                 RNS.log(f"[{self.name}] Failed to set flood scope '{self.flood_scope}': {result.payload}", RNS.LOG_ERROR)
             else:
                 RNS.log(f"[{self.name}] Flood scope set to '{self.flood_scope}'", RNS.LOG_INFO)
-        else:
-            # Always reset scope to ensure device isn't still tagged from a previous session
-            await self.mesh.commands.set_flood_scope(None)
-            RNS.log(f"[{self.name}] Flood scope reset (no scope configured)", RNS.LOG_DEBUG)
 
         #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx_raw)
 
@@ -662,10 +658,11 @@ class MeshCoreInterface(Interface):
 
         if self.loop and self.loop.is_running():
             if self.mesh:
-                try:
-                    asyncio.run_coroutine_threadsafe(self.mesh.commands.set_flood_scope(None), self.loop)
-                except Exception:
-                    pass
+                if self.flood_scope:
+                    try:
+                        asyncio.run_coroutine_threadsafe(self.mesh.commands.set_flood_scope(None), self.loop)
+                    except Exception:
+                        pass
                 try:
                     asyncio.run_coroutine_threadsafe(self.mesh.disconnect(), self.loop)
                 except Exception as e:

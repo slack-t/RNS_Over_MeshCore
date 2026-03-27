@@ -120,9 +120,11 @@ This mode is best suited for **reliable links** where MeshCore consistently deli
 
 ### Fragment MTU
 
-The `fragment_mtu` setting controls how many payload bytes each fragment carries. The default (100 bytes) is conservative. If your MeshCore hardware reliably handles larger channel messages, increasing this reduces the number of fragments (and delay cycles) needed per packet.
+The `fragment_mtu` setting controls how many payload bytes each fragment carries.
 
-For example, a 250-byte RNS announce at `fragment_mtu = 100` requires 3 fragments, but at `fragment_mtu = 200` it fits in 2 — cutting total send time by a third. Test incrementally (150, 200, 250) and watch for send errors in the log.
+**Important:** MeshCore channel messages have a ~133-character text limit. With base64 encoding (33% overhead), the effective binary limit per fragment is 99 bytes (132 base64 chars). The 5-byte fragment header takes 5 of those, leaving **94 bytes max payload** that repeaters will forward. The default is set to 94 for this reason.
+
+Do not increase `fragment_mtu` above 94 if you want fragments to be relayed by repeaters. Higher values will work for direct node-to-node links but will be silently dropped by repeaters.
 
 ### Flood Scope
 
