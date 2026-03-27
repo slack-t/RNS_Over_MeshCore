@@ -142,11 +142,15 @@ class MeshCoreInterface(Interface):
         while not self.detached:
             try:
                 await self._connect_once()
-                return
+                while self.online and not self.detached:
+                    await asyncio.sleep(1)
+                if not self.detached:
+                    RNS.log(f"[{self.name}] MeshCore disconnected, retrying...", RNS.LOG_WARNING)
             except Exception as e:
                 with self._lock:
                     self.online = False
-                RNS.log(f"[{self.name}] MeshCore connect failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
+                if not self.detached:
+                    RNS.log(f"[{self.name}] MeshCore connect failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
                 await asyncio.sleep(3)
 
     async def _find_free_channel(self):
@@ -350,10 +354,12 @@ class MeshCoreInterface(Interface):
         buf = self._fragment_buffers[key]
         buf[chunk_idx] = chunk_data
         meta["received"].add(chunk_idx)
+        RNS.log(f"[{self.name}] RX V1: received fragment {chunk_idx + 1}/{total_chunks} for {key}", RNS.LOG_DEBUG)
         
         if len(meta["received"]) == meta["total"]:
             expected_indices = set(range(meta["total"]))
             if meta["received"] == expected_indices:
+                RNS.log(f"[{self.name}] RX V1: reassembly complete for {key} ({meta['total']} fragments)", RNS.LOG_DEBUG)
                 assembled = b''.join(buf[i] for i in range(meta["total"]))
                 del self._fragment_buffers[key]
                 del self._fragment_meta[key]
@@ -389,10 +395,12 @@ class MeshCoreInterface(Interface):
         buf = self._fragment_buffers[key]
         buf[chunk_idx] = chunk_data
         meta["received"].add(chunk_idx)
+        RNS.log(f"[{self.name}] RX: received fragment {chunk_idx + 1}/{total_chunks} for {key}", RNS.LOG_DEBUG)
 
         if len(meta["received"]) == meta["total"]:
             expected = set(range(meta["total"]))
             if meta["received"] == expected:
+                RNS.log(f"[{self.name}] RX: reassembly complete for {key} ({meta['total']} fragments)", RNS.LOG_DEBUG)
                 assembled = b"".join(buf[i] for i in range(meta["total"]))
                 del self._fragment_buffers[key]
                 del self._fragment_meta[key]
@@ -409,54 +417,6 @@ class MeshCoreInterface(Interface):
         self._recent_packets[pkt_hash] = now
         return False
 
-    async def _rx_raw(self, event):
-        try:
-            now = time.time()
-            with self._lock:
-                expired_keys = [
-                    key for key, ts in self._fragment_timestamps.items()
-                    if now - ts > self.fragment_timeout
-                ]
-                for key in expired_keys:
-                    RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
-                    self._fragment_buffers.pop(key, None)
-                    self._fragment_meta.pop(key, None)
-                    self._fragment_timestamps.pop(key, None)
-                expired_dedup = [
-                    h for h, ts in self._recent_packets.items()
-                    if now - ts > self.fragment_timeout
-                ]
-                for h in expired_dedup:
-                    del self._recent_packets[h]
-
-            print(event)
-            data = event.payload
-            
-            if len(data) < 1:
-                return
-            
-            flags = data[0]
-            mesh_payload = data[1:]
-            
-            if flags == FLAG_UNFRAGMENTED:
-                assembled = mesh_payload
-            elif flags == FLAG_FRAGMENTED:
-                assembled = self._reassemble_fragment(mesh_payload)
-            else:
-                return
-            
-            if assembled is None:
-                return
-
-            if self._is_duplicate_packet(assembled):
-                return
-
-            with self._lock:
-                self.rxb += len(assembled)
-            self.owner.inbound(assembled, self)
-
-        except Exception as e:
-            RNS.log(f"[{self.name}] RX error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
     async def _rx(self, event):
         try:
             now = time.time()
@@ -518,6 +478,7 @@ class MeshCoreInterface(Interface):
 
             with self._lock:
                 self.rxb += len(assembled)
+            RNS.log(f"[{self.name}] RX: delivered packet to RNS ({len(assembled)} bytes)", RNS.LOG_DEBUG)
             self.owner.inbound(assembled, self)
 
         except Exception as e:
@@ -551,39 +512,6 @@ class MeshCoreInterface(Interface):
             self.loop.call_soon_threadsafe(self._tx_queue.put_nowait, data)
         except Exception as e:
             RNS.log(f"[{self.name}] TX queue error: {e}", RNS.LOG_ERROR)
-    async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
-        """
-        Send raw bytes to a MeshCore channel, bypassing utf-8 encoding.
-        """
-        if timestamp is None:
-            import time
-            timestamp_bytes = int(time.time()).to_bytes(4, "little")
-        elif isinstance(timestamp, int):
-            timestamp_bytes = timestamp.to_bytes(4, "little")
-        else:
-            import time
-            timestamp_bytes = int(time.time()).to_bytes(4, "little")
-        
-        packet = (
-            b"\x03\x00" +
-            channel_idx.to_bytes(1, "little") +
-            timestamp_bytes +
-            msg.encode("latin-1")
-        )
-        
-        return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
-    async def _send_raw(self, data: bytes) -> Event:
-        """
-        Send raw bytes over the air
-        """
-        
-        packet = (
-            b"\x19\x00" +
-            data
-        )
-        
-        return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
-    
     async def _tx_worker(self):
         """Async worker: drains TX queue, fragments, sends with interleaved repetition and adaptive pacing."""
         try:
@@ -723,7 +651,7 @@ class MeshCoreInterface(Interface):
                 text = new_text
             else:
                 text = original_text
-        return text
+        return text.rstrip()
 
     def __str__(self):
         return f"MeshCoreInterface[{self.name}]"
