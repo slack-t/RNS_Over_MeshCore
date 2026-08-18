@@ -33,6 +33,191 @@ FLAG_FRAGMENTED = 0xFF
 FRAGMENT_MTU_DEFAULT = 94  # base64(94+5 header=99 bytes)=132 chars, fits within MeshCore's 133-char limit
 FRAGMENT_HEADER_SIZE = 5
 
+# =============================================================================
+# SPI HARDWARE PROFILES (transport = spi, drives an SX1262 directly via pymc_core)
+# =============================================================================
+# Pin mapping and DIO wiring for the HackerGadgets AIO v2 uConsole expansion
+# board. use_dio3_tcxo/use_dio2_rf are load-bearing: without them the chip
+# responds to basic SPI commands but every TX/CAD attempt silently fails.
+HARDWARE_PROFILES = {
+    "uconsole": {
+        "bus_id": 1,
+        "cs_id": 0,
+        "cs_pin": -1,
+        "reset_pin": 25,
+        "busy_pin": 24,
+        "irq_pin": 26,
+        "txen_pin": -1,
+        "rxen_pin": -1,
+        "use_dio3_tcxo": True,
+        "use_dio2_rf": True,
+    },
+}
+
+# =============================================================================
+# SPI REGION PRESETS (transport = spi) — must match the actual over-the-air
+# parameters of the MeshCore companion radio(s)/repeaters on the mesh you're
+# joining. These are the standard MeshCore regional presets; individual
+# frequency/bandwidth/spreading_factor/coding_rate/preamble_length/sync_word
+# config values still override whichever preset is selected.
+# =============================================================================
+REGION_PRESETS = {
+    "us": {
+        "frequency": 910525000, "bandwidth": 62500,
+        "spreading_factor": 7, "coding_rate": 5,
+        "preamble_length": 17, "sync_word": 0x3444,
+    },
+    "eu": {
+        "frequency": 869618000, "bandwidth": 62500,
+        "spreading_factor": 8, "coding_rate": 8,
+        "preamble_length": 17, "sync_word": 0x3444,
+    },
+}
+
+
+def _load_or_create_spi_identity(path: str) -> bytes:
+    """Load a persisted 32-byte pymc_core node identity seed, generating one on first use."""
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return base64.b64decode(f.read().strip())
+        except Exception:
+            pass
+    seed = os.urandom(32)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(base64.b64encode(seed))
+    return seed
+
+
+class _PymcSpiBackend:
+    """Adapts pymc_core (direct SX1262-over-SPI MeshCore stack) to the small
+    subset of the `meshcore` companion-protocol client's API that
+    MeshCoreInterface relies on (commands.get_channel/set_channel/send_chan_msg,
+    subscribe, start_auto_message_fetching, disconnect), so the rest of the
+    interface (fragmentation, TX queue, dedup, flood_scope) works unmodified
+    regardless of which transport is in use."""
+
+    def __init__(self, name, event_type_cls, event_cls, radio_kwargs, identity_seed, node_name):
+        from pymc_core import LocalIdentity, MeshNode
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from pymc_core.node.events import EventService, EventSubscriber, MeshEvents
+        from pymc_core.protocol.packet_builder import PacketBuilder
+
+        self._name = name
+        self._event_type_cls = event_type_cls
+        self._event_cls = event_cls
+        self._mesh_events = MeshEvents
+        self._packet_builder = PacketBuilder
+        self._handlers = defaultdict(list)
+        self._channels = {}  # idx -> {"name": str, "secret": bytes}
+        self._node_name = node_name
+
+        self._radio = SX1262Radio(**radio_kwargs)
+        self._identity = LocalIdentity(seed=identity_seed)
+        self._event_service = EventService()
+
+        backend = self
+
+        class _ChannelDB:
+            def get_channels(self_inner):
+                return [{"name": ch["name"], "secret": ch["secret"].hex()} for ch in backend._channels.values()]
+
+        class _Bridge(EventSubscriber):
+            async def handle_event(self_inner, event_type, data):
+                await backend._on_pymc_event(event_type, data)
+
+        self._channel_db = _ChannelDB()
+        self._event_service.subscribe_all(_Bridge())
+
+        self._node = MeshNode(
+            self._radio, self._identity,
+            config={"node": {"name": node_name}},
+            channel_db=self._channel_db,
+            event_service=self._event_service,
+        )
+        self._dispatcher_task = None
+
+    def begin(self) -> bool:
+        return self._radio.begin()
+
+    async def start(self):
+        self._dispatcher_task = asyncio.get_event_loop().create_task(self._node.start())
+
+    def subscribe(self, event_type, handler):
+        self._handlers[event_type].append(handler)
+
+    async def _dispatch(self, event_type, payload):
+        for handler in self._handlers.get(event_type, []):
+            await handler(self._event_cls(event_type, payload))
+
+    async def _on_pymc_event(self, event_type, data):
+        if event_type != self._mesh_events.NEW_CHANNEL_MESSAGE:
+            return
+        idx = next((i for i, ch in self._channels.items() if ch["name"] == data.get("channel_name")), None)
+        if idx is None:
+            return
+        text = f'{data.get("sender_name", "")}: {data.get("message_text", "")}'
+        await self._dispatch(self._event_type_cls.CHANNEL_MSG_RECV, {"channel_idx": idx, "text": text})
+
+    @property
+    def commands(self):
+        return self
+
+    async def get_channel(self, idx):
+        ch = self._channels.get(idx)
+        if ch is None:
+            # Unclaimed slot: report the same "free" shape real MeshCore firmware does.
+            return self._event_cls(self._event_type_cls.CHANNEL_INFO, {"channel_name": "", "channel_secret": bytes(16)})
+        return self._event_cls(self._event_type_cls.CHANNEL_INFO, {"channel_name": ch["name"], "channel_secret": ch["secret"]})
+
+    async def set_channel(self, idx, name, secret):
+        self._channels[idx] = {"name": name, "secret": secret}
+        return self._event_cls(self._event_type_cls.OK, {})
+
+    async def send_chan_msg(self, idx, msg):
+        ch = self._channels.get(idx)
+        if ch is None:
+            return self._event_cls(self._event_type_cls.ERROR, {"error": "unknown_channel"})
+        try:
+            pkt = self._packet_builder.create_group_datagram(
+                group_name=ch["name"],
+                local_identity=self._identity,
+                message=msg,
+                sender_name=self._node_name,
+                channels_config=[{"name": ch["name"], "secret": ch["secret"].hex()}],
+            )
+            sent = await self._node.dispatcher.send_packet(pkt, wait_for_ack=False)
+            if not sent:
+                return self._event_cls(self._event_type_cls.ERROR, {"error": "send_packet returned False"})
+            return self._event_cls(self._event_type_cls.OK, {})
+        except Exception as e:
+            return self._event_cls(self._event_type_cls.ERROR, {"error": str(e)})
+
+    async def start_auto_message_fetching(self):
+        return None
+
+    async def set_flood_scope(self, scope):
+        # pymc_core's Dispatcher tags flood packets with a region transport
+        # key the same way MeshCore firmware's region put/allowf does (SHA-256
+        # of "#<name>"), applied automatically inside send_packet().
+        from pymc_core.protocol.transport_keys import get_auto_key_for
+
+        try:
+            if scope:
+                name = scope if scope.startswith("#") else f"#{scope}"
+                self._node.dispatcher.flood_transport_key = get_auto_key_for(name)
+            else:
+                self._node.dispatcher.flood_transport_key = None
+            return self._event_cls(self._event_type_cls.OK, {})
+        except Exception as e:
+            return self._event_cls(self._event_type_cls.ERROR, {"error": str(e)})
+
+    async def disconnect(self):
+        if self._dispatcher_task and not self._dispatcher_task.done():
+            self._dispatcher_task.cancel()
+
+
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
 
@@ -91,6 +276,46 @@ class MeshCoreInterface(Interface):
         # Flood scope: limit message propagation to repeaters allowing this scope.
         # Repeaters must be configured to allow the same scope string.
         self.flood_scope = ifconf.get("flood_scope", None)
+
+        # === SPI transport (drives an SX1262 directly via pymc_core, e.g. the
+        # uConsole HackerGadgets AIO v2 board) ===
+        self.hardware_profile = ifconf.get("hardware_profile", "uconsole")
+        profile = HARDWARE_PROFILES.get(self.hardware_profile, {})
+
+        def _pin(key, default):
+            val = ifconf.get(key)
+            return int(val) if val is not None else profile.get(key, default)
+
+        self.spi_bus_id = _pin("bus_id", 1)
+        self.spi_cs_id = _pin("cs_id", 0)
+        self.spi_cs_pin = _pin("cs_pin", -1)
+        self.spi_reset_pin = _pin("reset_pin", 25)
+        self.spi_busy_pin = _pin("busy_pin", 24)
+        self.spi_irq_pin = _pin("irq_pin", 26)
+        self.spi_txen_pin = _pin("txen_pin", -1)
+        self.spi_rxen_pin = _pin("rxen_pin", -1)
+        self.spi_use_dio3_tcxo = str(ifconf.get("use_dio3_tcxo", profile.get("use_dio3_tcxo", False))).lower() == "true"
+        self.spi_use_dio2_rf = str(ifconf.get("use_dio2_rf", profile.get("use_dio2_rf", False))).lower() == "true"
+
+        # Radio parameters: must match the actual MeshCore mesh (companion
+        # radios + repeaters) you're joining. `region_preset` selects a standard
+        # preset (default "us"); any individual key below overrides it.
+        self.spi_region_preset = ifconf.get("region_preset", "us").lower()
+        region_preset = REGION_PRESETS.get(self.spi_region_preset, REGION_PRESETS["us"])
+
+        self.spi_tx_power = int(ifconf.get("tx_power", 22))
+        self.spi_frequency = int(ifconf.get("frequency", region_preset["frequency"]))
+        self.spi_bandwidth = int(ifconf.get("bandwidth", region_preset["bandwidth"]))
+        self.spi_spreading_factor = int(ifconf.get("spreading_factor", region_preset["spreading_factor"]))
+        self.spi_coding_rate = int(ifconf.get("coding_rate", region_preset["coding_rate"]))
+        self.spi_preamble_length = int(ifconf.get("preamble_length", region_preset["preamble_length"]))
+        self.spi_sync_word = int(ifconf.get("sync_word", region_preset["sync_word"]))
+
+        self.spi_node_name = ifconf.get("spi_node_name", self.name)
+        self.spi_identity_path = ifconf.get(
+            "spi_identity_path",
+            os.path.join(os.path.expanduser("~"), ".reticulum", "storage", "meshcore_spi_identity"),
+        )
 
         # State
         self.online = False
@@ -234,6 +459,8 @@ class MeshCoreInterface(Interface):
             self.mesh = await self._meshcore_cls.create_tcp(self.host, self.tcp_port)
         elif self.transport == "ble":
             self.mesh = await self._open_ble_mesh()
+        elif self.transport == "spi":
+            self.mesh = await self._open_spi_mesh()
         else:
             raise ValueError(f"Invalid transport '{self.transport}'")
 
@@ -294,6 +521,37 @@ class MeshCoreInterface(Interface):
             raise IOError(f"BLE device '{self.ble_name}' not found")
         
         return await self._meshcore_cls.create_ble()
+
+    async def _open_spi_mesh(self):
+        if importlib.util.find_spec("pymc_core") is None:
+            RNS.log(f"[{self.name}] The 'spi' transport requires the 'pymc_core' module to be installed.", RNS.LOG_CRITICAL)
+            RNS.log(f"[{self.name}] Install it with: pip install 'pymc_core[hardware]>=1.0.12'", RNS.LOG_CRITICAL)
+            raise ImportError("pymc_core not installed")
+
+        identity_seed = _load_or_create_spi_identity(self.spi_identity_path)
+
+        backend = _PymcSpiBackend(
+            name=self.name,
+            event_type_cls=self._event_type_cls,
+            event_cls=Event,
+            radio_kwargs=dict(
+                bus_id=self.spi_bus_id, cs_id=self.spi_cs_id, cs_pin=self.spi_cs_pin,
+                reset_pin=self.spi_reset_pin, busy_pin=self.spi_busy_pin, irq_pin=self.spi_irq_pin,
+                txen_pin=self.spi_txen_pin, rxen_pin=self.spi_rxen_pin,
+                frequency=self.spi_frequency, tx_power=self.spi_tx_power,
+                spreading_factor=self.spi_spreading_factor, bandwidth=self.spi_bandwidth,
+                coding_rate=self.spi_coding_rate, preamble_length=self.spi_preamble_length,
+                sync_word=self.spi_sync_word,
+                use_dio3_tcxo=self.spi_use_dio3_tcxo, use_dio2_rf=self.spi_use_dio2_rf,
+            ),
+            identity_seed=identity_seed,
+            node_name=self.spi_node_name,
+        )
+        RNS.log(f"[{self.name}] Bringing up SX1262 over SPI (profile={self.hardware_profile}, bus={self.spi_bus_id})...", RNS.LOG_INFO)
+        if not backend.begin():
+            raise IOError("SX1262 radio init (begin()) failed")
+        await backend.start()
+        return backend
 
     def _fragment_outgoing(self, data):
         mtu = self.fragment_mtu
@@ -642,10 +900,12 @@ class MeshCoreInterface(Interface):
             location = f"{self.host}:{self.tcp_port}"
         elif self.transport == "ble":
             location = self.ble_name or "BLE:auto"
+        elif self.transport == "spi":
+            location = f"{self.hardware_profile}@{self.spi_frequency / 1e6:.3f}MHz"
         else:
             location = "unknown"
         chan_str = f"{self.channel_idx}" if self.channel_idx is not None else "auto"
-        return f"{self.name}: {status}, {self.transport}://{location}, channel={chan_str}, MTU={self.HW_MTU} (frag={FRAGMENT_MTU})"
+        return f"{self.name}: {status}, {self.transport}://{location}, channel={chan_str}, MTU={self.HW_MTU} (frag={self.fragment_mtu})"
 
     def detach(self):
         self.detached = True

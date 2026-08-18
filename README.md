@@ -13,7 +13,7 @@ Interface for Reticulum Network Stack (RNS) using MeshCore as the underlying net
 - Python 3.10+
 - [meshcore](https://pypi.org/project/meshcore/) Python library
 - Reticulum Network Stack (`rnsd`)
-- Compatible LoRa device with MeshCore firmware
+- Compatible LoRa device with MeshCore firmware (BLE/serial/TCP transports), **or** an SX1262 LoRa chip wired directly over SPI (e.g. the uConsole HackerGadgets AIO v2 board) using [`pymc_core[hardware]>=1.0.12`](https://pypi.org/project/pymc-core/) — see [SPI / uConsole AIO v2](#spi--uconsole-aio-v2) below
 
 ---
 
@@ -53,12 +53,35 @@ Add the following to your `~/.reticulum/config` file:
    interface_enabled = true
 
    # === Transport settings ===
-   transport = ble           # Options: ble | serial | tcp
+   transport = ble           # Options: ble | serial | tcp | spi
    #port = /dev/ttyUSB0       # Serial port if transport = serial
    #baudrate = 115200         # Serial baudrate
    #host = 127.0.0.1          # TCP host if transport = tcp
    #tcp_port = 4403           # TCP port if transport = tcp
    ble_name = MeshCore-Obdolbus  # BLE device name (optional, auto-scan if empty)
+
+   # === SPI settings (transport = spi only) — drives an SX1262 chip directly,
+   # no companion MeshCore firmware/device needed. See "SPI / uConsole AIO v2" below.
+   #hardware_profile = uconsole   # Pin mapping preset. Currently: uconsole
+   #region_preset = us            # Radio parameter preset: us | eu. Must match your mesh's
+                                   # companion radios/repeaters. See region table below
+   #tx_power = 22                 # dBm (max 22 for SX1262)
+   # Any of these override the selected region_preset individually:
+   #frequency = 910525000         # Hz
+   #bandwidth = 62500             # Hz
+   #spreading_factor = 7
+   #coding_rate = 5
+   #preamble_length = 17
+   #sync_word = 13380             # 0x3444 — MeshCore network
+   #spi_node_name =               # Advertised sender name; defaults to the interface's `name`
+   #spi_identity_path =           # Where the node's persisted identity seed is stored;
+                                   # defaults to ~/.reticulum/storage/meshcore_spi_identity
+   # Advanced: override individual pins from hardware_profile (rarely needed)
+   #bus_id = 1
+   #cs_pin = -1
+   #reset_pin = 25
+   #busy_pin = 24
+   #irq_pin = 26
 
    # === RNS channel settings ===
    # IMPORTANT: Change channel_secret to a unique value! The default is published
@@ -143,7 +166,39 @@ region put rnstunnel
 region allowf rnstunnel
 ```
 
-All RNS nodes must use the same `flood_scope` value, and all repeaters in the path must allow that scope. If `flood_scope` is not set, messages use standard flood routing with no scope restriction.
+All RNS nodes must use the same `flood_scope` value, and all repeaters in the path must allow that scope. If `flood_scope` is not set, messages use standard flood routing with no scope restriction. This works the same way regardless of transport, including `spi`.
+
+### SPI / uConsole AIO v2
+
+`transport = spi` drives an SX1262 LoRa chip directly over SPI using [`pymc_core[hardware]`](https://pypi.org/project/pymc-core/) — a full local MeshCore protocol + radio stack — instead of talking to a separate MeshCore companion device over BLE/serial/TCP. This turns a host with the chip wired to its SPI bus (such as a uConsole with the HackerGadgets AIO v2 expansion board) into a self-contained RNS-over-MeshCore node with no external radio.
+
+Install the extra dependency (Linux-only; not required for the other three transports):
+
+```bash
+pip install "pymc_core[hardware]>=1.0.12"
+```
+
+`>=1.0.12` is required — earlier versions have a hardcoded SPI1 chip-select workaround for boards like this one that corrupts SPI reads, causing the exact same symptoms as a genuine hardware fault (chip inits fine, every TX/CAD attempt then silently fails).
+
+**Hardware prerequisites** (uConsole CM4 + AIO v2, done once, outside this interface):
+1. Enable SPI1 by adding `dtoverlay=spi1-1cs` under `[all]` in `/boot/firmware/config.txt` (do **not** add `dtparam=spi=on` — it conflicts with the uConsole's backlight on the same GPIO). Reboot, then confirm `/dev/spidev1.0` exists.
+2. Power the LoRa module and keep it powered across reboots — it's gated by GPIO16, managed by [`aiov2_ctl`](https://github.com/hackergadgets/aiov2_ctl) (`sudo aiov2_ctl --boot-rail LORA on`). This interface does not manage the power rail itself.
+3. If any other software drives this same radio (e.g. `meshtasticd`), stop and mask it first — two processes cannot hold the SPI1 bus at once (`sudo systemctl stop meshtasticd.service && sudo systemctl mask meshtasticd.service`).
+
+The `uconsole` hardware profile (the default for `hardware_profile`) already has the correct pin mapping (SPI1, native CS0, reset=25/busy=24/irq=26) and the `use_dio3_tcxo`/`use_dio2_rf` flags this board requires — without them the chip responds to basic SPI commands at boot (so it *looks* like it's working) but the RF frontend and TCXO clock reference are unstable and every transmission silently fails to leave the antenna.
+
+Radio parameters (`frequency`, `bandwidth`, `spreading_factor`, `coding_rate`, `tx_power`, `preamble_length`, `sync_word`) must **exactly** match the actual over-the-air parameters of the companion radio(s)/repeaters on the MeshCore mesh you're joining — a mismatch on any of these means your packets simply never get heard, with no error on either side (the interface will connect and transmit successfully; it just won't be received by anything).
+
+`region_preset` selects a named bundle of these values so you don't have to enter them all by hand — currently:
+
+| `region_preset` | `frequency` | `bandwidth` | `spreading_factor` | `coding_rate` |
+|---|---|---|---|---|
+| `us` (default) | 910525000 | 62500 | 7 | 5 |
+| `eu` | 869618000 | 62500 | 8 | 8 |
+
+Australia (915800000 Hz) and New Zealand (917375000 Hz) use different frequencies too, but aren't included as named presets here since their bandwidth/spreading-factor/coding-rate aren't confirmed — set `frequency` (and the other params, if you know them) individually instead. Any individual key overrides whatever `region_preset` selected, so you can start from a preset and tweak just one value if needed.
+
+The node's cryptographic identity (separate from the RNS `channel_secret`) is a random 32-byte seed generated on first run and persisted to `spi_identity_path` (default `~/.reticulum/storage/meshcore_spi_identity`) — back this file up if you want the node to keep the same mesh identity across reinstalls.
 
 ### Interleaved Repetition
 
@@ -177,6 +232,17 @@ This spreads copies of each fragment across time, making transmission more resil
    tcp_port = 4403
    opportunistic_sending = true
    guard_delay = 0.1
+```
+
+**uConsole AIO v2** (direct SPI, US region, self-contained node):
+```ini
+[[MeshCore]]
+   type = MeshCoreInterface
+   interface_enabled = true
+   transport = spi
+   hardware_profile = uconsole
+   frequency = 910525000
+   opportunistic_sending = true
 ```
 
 **Unstable LoRa link** (high repetition, conservative delays):
@@ -226,6 +292,12 @@ Fragment IDs are salted with 4 bytes of per-session randomness, so the same payl
 ---
 
 ## Recent Fixes
+
+### SPI transport for direct-attached radios (uConsole AIO v2)
+Added `transport = spi`, driving an SX1262 chip directly over SPI via `pymc_core[hardware]` instead of requiring a separate MeshCore companion device. Fragmentation, adaptive delay, dedup, and `flood_scope` all work identically to the other three transports. `region_preset` (`us`/`eu`) bundles the frequency/bandwidth/spreading-factor/coding-rate values that must match your actual mesh; individual values still override it. See [SPI / uConsole AIO v2](#spi--uconsole-aio-v2).
+
+### Fixed status string crash
+`get_status_string()` referenced an undefined module-level name instead of the configured `fragment_mtu`, raising `NameError` whenever it was called.
 
 ### Configurable fragment timeout
 The `fragment_timeout` setting was previously documented but never actually read from config — the timeout was hardcoded to 180 seconds. It is now properly wired up, so users can tune how long incomplete fragment reassemblies are kept in memory before being discarded. This prevents unbounded memory growth on long-running nodes that receive partial transmissions.
